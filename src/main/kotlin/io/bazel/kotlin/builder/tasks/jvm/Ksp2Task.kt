@@ -225,15 +225,6 @@ class Ksp2Task : Work {
       //     Annotation-processor JARs + their transitive deps (Hilt, Room, Skabbard, …)
       //     Variable per target; typically a few MB, trivially GC-eligible after close().
       //
-      // Disable JAR URL connection caching before creating classloaders. By default, Java's
-      // JarURLConnection maintains a static fileCache that maps JAR paths to shared JarFile
-      // instances. In a multiplex worker, concurrent actions load KSP2/processor JARs from
-      // the same paths. When one action's URLClassLoader.close() closes its JarFile handle,
-      // any concurrent action reading the same cached JarFile via getResourceAsStream() gets
-      // "Stream closed" (observed as InvalidProtocolBufferException in FirFallbackBuiltinSymbolProvider
-      // / ProtoBuf.PackageFragment.parseFrom). Setting false ensures each URLClassLoader
-      // opens its own JarFile instance, not shared with or invalidated by concurrent actions.
-      java.net.URLConnection.setDefaultUseCaches("jar", false)
 
       val coreClasspath = argMap.optional(Ksp2Flags.KSP2_CORE_CLASSPATH) ?: emptyList()
       val coreUrls = coreClasspath.map { File(it).toURI().toURL() }.toTypedArray()
