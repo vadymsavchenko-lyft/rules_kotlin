@@ -40,7 +40,6 @@ kt_bootstrap_binary(
         "-D@rules_kotlin...skip-code-gen=$(rlocationpath //src/main/kotlin:skip-code-gen)",
         "-D@rules_kotlin...compiler=$(rlocationpath //src/main/kotlin/io/bazel/kotlin/compiler:compiler.jar)",
         "-D@rules_kotlin..kotlin.compiler.kotlin-reflect=$(rlocationpath //kotlin/compiler:kotlin-reflect)",
-        "-XX:-MaxFDLimit",
     ],
     main_class = "io.bazel.kotlin.builder.cmd.Build",
     shade_rules = "//src/main/kotlin:shade.jarjar",
@@ -85,6 +84,24 @@ kt_bootstrap_binary(
     name = "ksp2",
     data = _KOTLIN_STDLIBS,
     final_runtime_deps = _KOTLIN_STDLIBS,
+    jvm_flags = [
+        # Heap cap: KSP2 processing is Metaspace-heavy (30k classes per classloader), not heap-heavy.
+        # Capping heap at 2 GB leaves room for Metaspace within Bazel's 8 GB per-worker RSS limit.
+        "-Xmx2g",
+        # Force class unloading GC before Metaspace hits 4 GB. Without a cap, the JVM only
+        # triggers Metaspace collection reactively (when the high-watermark grows to the OS limit),
+        # which in a multiplex worker with 8 concurrent KSP2 slots causes 8 * ~130 MB of class
+        # data to accumulate across many successive actions before a collection ever fires.
+        "-XX:MaxMetaspaceSize=4g",
+        # Allow IntelliJ soft-reference caches to survive under normal heap conditions.
+        # The two-tier classloader means per-action loaders hold only processor JARs (~few MB);
+        # they accumulate slowly within the 4 GB Metaspace cap and are reclaimed on natural GC
+        # cycles without forcing. Setting this to 0 caused IntelliJ's type/class caches to be
+        # evicted on every minor GC including mid-action, forcing repeated type re-resolution
+        # from disk. 100 ms/MB lets caches live during healthy operation and still die under
+        # genuine memory pressure.
+        "-XX:SoftRefLRUPolicyMSPerMB=100",
+    ],
     main_class = "io.bazel.kotlin.builder.cmd.Ksp2",
     shade_rules = "//src/main/kotlin:shade.jarjar",
     visibility = ["//src:__subpackages__"],

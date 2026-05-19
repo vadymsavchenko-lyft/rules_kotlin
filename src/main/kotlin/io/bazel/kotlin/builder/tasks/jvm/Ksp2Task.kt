@@ -26,12 +26,12 @@ import io.bazel.worker.WorkerContext
 import java.io.File
 import java.io.FileOutputStream
 import java.net.URLClassLoader
+import java.util.concurrent.atomic.AtomicReference
 import java.nio.charset.StandardCharsets
 import java.nio.file.FileSystems
 import java.nio.file.Files
 import java.nio.file.Path
 import java.util.jar.JarEntry
-import java.util.concurrent.ConcurrentHashMap
 import java.util.jar.JarOutputStream
 import java.util.jar.Manifest
 import java.util.regex.Pattern
@@ -47,19 +47,32 @@ import java.util.zip.ZipFile
  * 4. Packages generated sources/classes into output JARs
  *
  * This is a separate command from the main Build command for cleaner separation.
+ *
+ * ## Classloader architecture
+ *
+ * KSP2 loads ~40k classes per action (~130MB Metaspace). Loading them afresh per action
+ * in a single URLClassLoader caused the Metaspace to grow monotonically because the JVM
+ * cannot unload classes as long as any strong reference keeps the classloader alive, and
+ * IntelliJ's static infrastructure holds such references across actions.
+ *
+ * The fix is to split the classpath into two tiers, using separate Bazel flags:
+ *
+ *   sharedClassLoader (lives for the worker process lifetime)
+ *     └─ --ksp2_core_classpath: ksp2_invoker.jar + symbol-processing-aa.jar + KSP2 API jars
+ *        → the ~130 MB of IntelliJ/FIR/KSP2 infrastructure, same JARs for every target
+ *
+ *   kspClassLoader (per-action, closed after each action)
+ *     └─ parent: sharedClassLoader
+ *     └─ --processor_classpath: annotation-processor JARs + their transitive deps
+ *        → variable per target, typically a few MB, trivially GC-eligible after close()
  */
 class Ksp2Task : Work {
+  // Shared classloader holding the heavy KSP2/IntelliJ core jars — created once on the first
+  // action and reused for every subsequent action. Never closed.
+  private val sharedClassLoader = AtomicReference<URLClassLoader?>(null)
+
   companion object {
     private val FLAGFILE_RE = Pattern.compile("""^--flagfile=((.*)-(\d+).params)$""").toRegex()
-
-    /**
-     * Cache of isolated KSP2 classloaders keyed by processor classpath, shared across
-     * persistent-worker invocations in this JVM. Each URLClassLoader defines tens of
-     * thousands of KSP/kotlin-compiler classes; without caching, every worker action
-     * accumulates that many fresh class metadata entries in the compressed class space
-     * until the JVM OOMs. See KT-84566 / google/ksp#2817.
-     */
-    private val kspClassLoaderCache = ConcurrentHashMap<String, URLClassLoader>()
 
     enum class Ksp2Flags(
       override val flag: String,
@@ -68,6 +81,7 @@ class Ksp2Task : Work {
       SOURCES("--sources"),
       SOURCE_JARS("--source_jars"),
       LIBRARIES("--libraries"),
+      KSP2_CORE_CLASSPATH("--ksp2_core_classpath"),
       PROCESSOR_CLASSPATH("--processor_classpath"),
       GENERATED_SOURCES_OUTPUT("--generated_sources_output"),
       GENERATED_CLASSES_OUTPUT("--generated_classes_output"),
@@ -85,6 +99,19 @@ class Ksp2Task : Work {
       }
   }
 
+  // Returns the shared classloader, creating it from the core KSP2 JARs on the first call.
+  // Thread-safe via CAS; subsequent calls return the already-created instance.
+  private fun getOrCreateSharedClassLoader(coreUrls: Array<java.net.URL>): URLClassLoader {
+    sharedClassLoader.get()?.let { return it }
+    val newLoader = URLClassLoader(coreUrls, ClassLoader.getSystemClassLoader())
+    return if (sharedClassLoader.compareAndSet(null, newLoader)) {
+      newLoader
+    } else {
+      runCatching { newLoader.close() }
+      sharedClassLoader.get()!!
+    }
+  }
+
   override fun invoke(
     ctx: WorkerContext.TaskContext,
     args: Iterable<String>,
@@ -99,7 +126,10 @@ class Ksp2Task : Work {
 
     val argMap = ArgMaps.from(lines)
 
-    return if (execute(ctx, argMap) == 0) Status.SUCCESS else Status.ERROR
+    val exitCode = execute(ctx, argMap)
+    val nonHeap = java.lang.management.ManagementFactory.getMemoryMXBean().nonHeapMemoryUsage.used / 1024 / 1024
+    System.err.println("[KSP2] action done nonheap=${nonHeap}MB")
+    return if (exitCode == 0) Status.SUCCESS else Status.ERROR
   }
 
   private fun execute(
@@ -184,73 +214,107 @@ class Ksp2Task : Work {
         sourceRoots.add(stagedSourcesDir.toString())
       }
 
-      // Look up (or create) the cached classloader for this processor classpath.
-      // Reusing the loader across worker invocations is what prevents the compressed-
-      // class-space leak; see kspClassLoaderCache docs above.
+      // Two-tier classloader setup:
+      //
+      //   --ksp2_core_classpath   → sharedClassLoader (lives for the worker lifetime)
+      //     ksp2_invoker.jar + symbol-processing-aa.jar + KSP2 API jars + coroutines
+      //     These are the same JARs for every KSP2 target; they carry ~130MB of
+      //     IntelliJ/FIR classes that would OOM metaspace if reloaded per-action.
+      //
+      //   --processor_classpath   → kspClassLoader (per-action, closed after each action)
+      //     Annotation-processor JARs + their transitive deps (Hilt, Room, Skabbard, …)
+      //     Variable per target; typically a few MB, trivially GC-eligible after close().
+      //
+      // Disable JAR URL connection caching before creating classloaders. By default, Java's
+      // JarURLConnection maintains a static fileCache that maps JAR paths to shared JarFile
+      // instances. In a multiplex worker, concurrent actions load KSP2/processor JARs from
+      // the same paths. When one action's URLClassLoader.close() closes its JarFile handle,
+      // any concurrent action reading the same cached JarFile via getResourceAsStream() gets
+      // "Stream closed" (observed as InvalidProtocolBufferException in FirFallbackBuiltinSymbolProvider
+      // / ProtoBuf.PackageFragment.parseFrom). Setting false ensures each URLClassLoader
+      // opens its own JarFile instance, not shared with or invalidated by concurrent actions.
+      java.net.URLConnection.setDefaultUseCaches("jar", false)
+
+      val coreClasspath = argMap.optional(Ksp2Flags.KSP2_CORE_CLASSPATH) ?: emptyList()
+      val coreUrls = coreClasspath.map { File(it).toURI().toURL() }.toTypedArray()
+      val sharedCl = getOrCreateSharedClassLoader(coreUrls)
+
+      // Per-action classloader — holds only the processor JARs and their transitive deps,
+      // parented to sharedCl so it can see all KSP2 classes. Closed after the action;
+      // processor classes are trivially GC-eligible since they're not held by static state.
+      // IMPORTANT: This classloader MUST be closed at the end of the action.
       val processorClasspath = argMap.optional(Ksp2Flags.PROCESSOR_CLASSPATH) ?: emptyList()
-      val cacheKey = processorClasspath.sorted().joinToString(File.pathSeparator)
-      val kspClassLoader =
-        kspClassLoaderCache.computeIfAbsent(cacheKey) {
-          val urls = processorClasspath.map { File(it).toURI().toURL() }.toTypedArray()
-          URLClassLoader(urls, ClassLoader.getSystemClassLoader())
+      val processorUrls = processorClasspath.map { File(it).toURI().toURL() }.toTypedArray()
+      val kspClassLoader = URLClassLoader(processorUrls, sharedCl)
+
+      try {
+        val processorOptions = parseKspOptions(argMap.optional(Ksp2Flags.KSP_OPTIONS) ?: emptyList())
+
+        // Load Ksp2Invoker via reflection. The class lives in the shared classloader (loaded
+        // from ksp2_invoker.jar passed via --ksp2_core_classpath). The loadClass call delegates
+        // through kspClassLoader → sharedCl where the class is found.
+        val invokerClass = kspClassLoader.loadClass("io.bazel.kotlin.ksp2.Ksp2Invoker")
+        val invoker =
+          invokerClass
+            .getConstructor(ClassLoader::class.java)
+            .newInstance(kspClassLoader)
+        val executeMethod =
+          invokerClass.getMethod(
+            "execute",
+            String::class.java, // moduleName
+            List::class.java, // sourceRoots
+            List::class.java, // javaSourceRoots
+            List::class.java, // libraries
+            File::class.java, // kotlinOutputDir
+            File::class.java, // javaOutputDir
+            File::class.java, // classOutputDir
+            File::class.java, // resourceOutputDir
+            File::class.java, // cachesDir
+            File::class.java, // projectBaseDir
+            File::class.java, // outputBaseDir
+            String::class.java, // jvmTarget
+            String::class.java, // languageVersion
+            String::class.java, // apiVersion
+            File::class.java, // jdkHome
+            Map::class.java, // processorOptions
+            Int::class.java, // logLevel
+            ClassLoader::class.java, // processorClassLoader
+          )
+
+        // Execute KSP2
+        val code =
+          executeMethod.invoke(
+            invoker,
+            moduleName,
+            sourceRoots.map { File(it) },
+            javaSourceRoots.map { File(it) },
+            argMap.optional(Ksp2Flags.LIBRARIES)?.map { File(it) } ?: emptyList<File>(),
+            kotlinOutputDir.toFile(),
+            javaOutputDir.toFile(),
+            classOutputDir.toFile(),
+            resourceOutputDir.toFile(),
+            cachesDir.toFile(),
+            kspWorkDir.toFile(), // projectBaseDir
+            kspWorkDir.toFile(), // outputBaseDir
+            argMap.optionalSingle(Ksp2Flags.JVM_TARGET),
+            argMap.optionalSingle(Ksp2Flags.LANGUAGE_VERSION),
+            argMap.optionalSingle(Ksp2Flags.API_VERSION),
+            argMap.optionalSingle(Ksp2Flags.JDK_HOME)?.let { File(it) },
+            processorOptions,
+            1, // logLevel
+            kspClassLoader, // processorClassLoader
+          ) as Int
+
+        if (code != 0) {
+          taskContext.error { "KSP2 failed with exit code: $code" }
+          return code
         }
-
-      val processorOptions = parseKspOptions(argMap.optional(Ksp2Flags.KSP_OPTIONS) ?: emptyList())
-
-      // Load Ksp2Invoker via reflection (it's compiled against KSP2 classes)
-      val invokerClass = kspClassLoader.loadClass("io.bazel.kotlin.ksp2.Ksp2Invoker")
-      val invoker =
-        invokerClass
-          .getConstructor(ClassLoader::class.java)
-          .newInstance(kspClassLoader)
-      val executeMethod =
-        invokerClass.getMethod(
-          "execute",
-          String::class.java, // moduleName
-          List::class.java, // sourceRoots
-          List::class.java, // javaSourceRoots
-          List::class.java, // libraries
-          File::class.java, // kotlinOutputDir
-          File::class.java, // javaOutputDir
-          File::class.java, // classOutputDir
-          File::class.java, // resourceOutputDir
-          File::class.java, // cachesDir
-          File::class.java, // projectBaseDir
-          File::class.java, // outputBaseDir
-          String::class.java, // jvmTarget
-          String::class.java, // languageVersion
-          String::class.java, // apiVersion
-          File::class.java, // jdkHome
-          Map::class.java, // processorOptions
-          Int::class.java, // logLevel
-        )
-
-      // Execute KSP2
-      val code =
-        executeMethod.invoke(
-          invoker,
-          moduleName,
-          sourceRoots.map { File(it) },
-          javaSourceRoots.map { File(it) },
-          argMap.optional(Ksp2Flags.LIBRARIES)?.map { File(it) } ?: emptyList<File>(),
-          kotlinOutputDir.toFile(),
-          javaOutputDir.toFile(),
-          classOutputDir.toFile(),
-          resourceOutputDir.toFile(),
-          cachesDir.toFile(),
-          kspWorkDir.toFile(), // projectBaseDir
-          kspWorkDir.toFile(), // outputBaseDir
-          argMap.optionalSingle(Ksp2Flags.JVM_TARGET),
-          argMap.optionalSingle(Ksp2Flags.LANGUAGE_VERSION),
-          argMap.optionalSingle(Ksp2Flags.API_VERSION),
-          argMap.optionalSingle(Ksp2Flags.JDK_HOME)?.let { File(it) },
-          processorOptions,
-          1, // logLevel
-        ) as Int
-
-      if (code != 0) {
-        taskContext.error { "KSP2 failed with exit code: $code" }
-        return code
+      } finally {
+        try {
+          kspClassLoader.close()
+        } catch (_: Exception) {
+          // Ignore — best-effort cleanup.
+        }
       }
 
       // Package generated sources into srcjar
