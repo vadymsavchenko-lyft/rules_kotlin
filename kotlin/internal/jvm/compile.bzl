@@ -495,14 +495,8 @@ def _run_ksp_builder_actions(
     # Get the KSP2 invoker JAR (contains Ksp2Invoker class loaded via reflection)
     ksp2_invoker_jars = toolchains.kt.ksp2_invoker[JavaInfo].runtime_output_jars
 
-    # KSP2 infrastructure JARs (invoker + KSP2/IntelliJ core) go into a persistent shared
-    # classloader in the worker — loaded once, never unloaded. These are identical across all
-    # KSP2 targets in a single build (they come from the toolchain, not from user targets).
-    args.add_all("--ksp2_core_classpath", ksp2_invoker_jars)
-    args.add_all("--ksp2_core_classpath", ksp2_api_jars)
-
-    # Annotation-processor JARs and their transitive deps go into a per-action classloader
-    # that is closed and GC'd after each action.
+    args.add_all("--processor_classpath", ksp2_invoker_jars)
+    args.add_all("--processor_classpath", ksp2_api_jars)
     if transitive_runtime_jars:
         args.add_all("--processor_classpath", transitive_runtime_jars)
 

@@ -38,10 +38,6 @@ class Ksp2Invoker(
    * Execute KSP2 with the given configuration.
    *
    * @param logLevel Logger level (0=ERROR, 1=WARN, 2=INFO, 3=LOGGING)
-   * @param processorClassLoader classloader to use for ServiceLoader discovery of
-   *   SymbolProcessorProvider implementations. When using a two-tier classloader setup
-   *   (shared core CL + per-action processor CL), pass the per-action classloader here
-   *   so ServiceLoader scans only the annotation-processor JARs. Defaults to [classLoader].
    * @return Exit code (0 for success)
    */
   fun execute(
@@ -62,12 +58,9 @@ class Ksp2Invoker(
     jdkHome: File?,
     processorOptions: Map<String, String> = emptyMap(),
     logLevel: Int = 1,
-    processorClassLoader: ClassLoader = classLoader,
   ): Int {
-    // Load processors via ServiceLoader from the per-action classloader so only
-    // annotation-processor JARs are scanned (not the full KSP2 core classpath).
     val processors =
-      ServiceLoader.load(SymbolProcessorProvider::class.java, processorClassLoader).toList()
+      ServiceLoader.load(SymbolProcessorProvider::class.java, classLoader).toList()
 
     val kspConfig =
       KSPJvmConfig
@@ -92,11 +85,8 @@ class Ksp2Invoker(
           this.mapAnnotationArgumentsInJava = true
         }.build()
 
-    // Set context classloader to the shared KSP2 classloader before invoking.
-    // IntelliJ's PluginXmlPathResolver resolves plugin XML resources via
-    // Thread.currentThread().contextClassLoader — without this, the second+ action
-    // in a persistent worker gets "Stream closed" when the previous action's
-    // (now-closed) classloader is still set as the context classloader.
+    // IntelliJ's PluginXmlPathResolver resolves plugin XML resources via the context classloader.
+    // Set it to classLoader for the duration of the action so resource loading works correctly.
     val previousContextCl = Thread.currentThread().contextClassLoader
     Thread.currentThread().contextClassLoader = classLoader
     return try {
