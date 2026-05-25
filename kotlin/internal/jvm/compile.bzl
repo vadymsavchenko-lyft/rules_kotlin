@@ -495,7 +495,6 @@ def _run_ksp_builder_actions(
     # Get the KSP2 invoker JAR (contains Ksp2Invoker class loaded via reflection)
     ksp2_invoker_jars = toolchains.kt.ksp2_invoker[JavaInfo].runtime_output_jars
 
-    # Add processor JARs - includes KSP2 API JARs, invoker JAR, and user processor JARs
     args.add_all("--processor_classpath", ksp2_invoker_jars)
     args.add_all("--processor_classpath", ksp2_api_jars)
     if transitive_runtime_jars:

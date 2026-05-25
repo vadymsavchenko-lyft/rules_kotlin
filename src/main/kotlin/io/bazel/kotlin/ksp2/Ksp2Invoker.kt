@@ -5,13 +5,14 @@
  * you may not use this file except in compliance with the License.
  * You may obtain a copy of the License at
  *
- *    http://www.apache.org/licenses/LICENSE-2.0
+ *   http://www.apache.org/licenses/LICENSE-2.0
  *
- * Unless required by applicable law or agreed to in writing, software
- * distributed under the License is distributed on an "AS IS" BASIS,
- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- * See the License for the specific language governing permissions and
- * limitations under the License.
+ *  Unless required by applicable law or agreed to in writing, software
+ *  distributed under the License is distributed on an "AS IS" BASIS,
+ *  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ *  See the License for the specific language governing permissions and
+ *  limitations under the License.
+ *
  */
 package io.bazel.kotlin.ksp2
 
@@ -58,11 +59,9 @@ class Ksp2Invoker(
     processorOptions: Map<String, String> = emptyMap(),
     logLevel: Int = 1,
   ): Int {
-    // Load processors via ServiceLoader from the provided classloader
     val processors =
       ServiceLoader.load(SymbolProcessorProvider::class.java, classLoader).toList()
 
-    // Build KSP2 configuration
     val kspConfig =
       KSPJvmConfig
         .Builder()
@@ -87,45 +86,14 @@ class Ksp2Invoker(
           this.experimentalPsiResolution = true
         }.build()
 
-    // Create logger and execute
-    val logger = KspGradleLogger(logLevel)
-    val ksp = KotlinSymbolProcessing(kspConfig, processors, logger)
-
-    return ksp.execute().code
-  }
-
-  /**
-   * Shut down kotlinx-coroutines dispatchers loaded inside this invoker's classloader.
-   *
-   * Workaround for KT-84566 / google/ksp#2817. Only runs if kotlinx-coroutines is
-   * actually owned by [classLoader]; if it lives in a parent (e.g. on the worker's
-   * system classpath), `DefaultScheduler.INSTANCE` is a process-wide singleton shared
-   * across all requests and shutting it down would break subsequent invocations with
-   * RejectedExecutionException.
-   *
-   * The IntelliJ kotlinx-coroutines variant bundled with KSP2 does not expose the
-   * public `Dispatchers.shutdown()` extension, so we call the internal entry points
-   * directly. Resolved reflectively because kotlinx-coroutines-core is not on
-   * Ksp2Invoker's compile classpath.
-   */
-  fun shutdown() {
-    try {
-      val scheduler = Class.forName("kotlinx.coroutines.scheduling.DefaultScheduler", true, classLoader)
-      if (scheduler.classLoader === classLoader) {
-        val instance = scheduler.getField("INSTANCE").get(null)
-        scheduler.getMethod("shutdown\$kotlinx_coroutines_core").invoke(instance)
-      }
-    } catch (t: Throwable) {
-      System.err.println("KSP2 DefaultScheduler shutdown skipped/failed: $t")
-    }
-    try {
-      val executor = Class.forName("kotlinx.coroutines.DefaultExecutor", true, classLoader)
-      if (executor.classLoader === classLoader) {
-        val instance = executor.getField("INSTANCE").get(null)
-        executor.getMethod("shutdown").invoke(instance)
-      }
-    } catch (t: Throwable) {
-      System.err.println("KSP2 DefaultExecutor shutdown skipped/failed: $t")
+    // IntelliJ's PluginXmlPathResolver resolves plugin XML resources via the context classloader.
+    // Set it to classLoader for the duration of the action so resource loading works correctly.
+    val previousContextCl = Thread.currentThread().contextClassLoader
+    Thread.currentThread().contextClassLoader = classLoader
+    return try {
+      KotlinSymbolProcessing(kspConfig, processors, KspGradleLogger(logLevel)).execute().code
+    } finally {
+      Thread.currentThread().contextClassLoader = previousContextCl
     }
   }
 }

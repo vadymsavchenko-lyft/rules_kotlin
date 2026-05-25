@@ -51,6 +51,7 @@ def _ksp_compiler_plugin_repository_impl(repository_ctx):
         return None
 
     return repository_ctx.repo_metadata(
+        # Non-reproducible when using a local override (mtime changes on rebuild).
         reproducible = attr.sha256 != "",
     )
 
