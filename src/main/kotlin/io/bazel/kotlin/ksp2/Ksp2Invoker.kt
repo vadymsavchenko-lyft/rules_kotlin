@@ -84,6 +84,7 @@ class Ksp2Invoker(
           jdkHome?.let { this.jdkHome = it }
           this.processorOptions = processorOptions
           this.mapAnnotationArgumentsInJava = true
+          this.experimentalPsiResolution = true
         }.build()
 
     // Create logger and execute
