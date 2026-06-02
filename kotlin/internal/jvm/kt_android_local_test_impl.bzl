@@ -224,6 +224,7 @@ def _process_jvm(ctx, resources_ctx, **_unused_sub_ctxs):
             android_properties_file = ctx.file.robolectric_properties_file.short_path,
             additional_jvm_flags = jvm_flags,
         ),
+#        //We need to also declare here
         runfiles = ctx.runfiles(
             files = runfiles,
             transitive_files = depset(transitive = transitive),

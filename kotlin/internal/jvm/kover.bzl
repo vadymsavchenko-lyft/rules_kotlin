@@ -75,19 +75,19 @@ def get_kover_agent_file(ctx):
     kover_agent_info = kover_agent[DefaultInfo]
     return kover_agent_info.files.to_list()
 
-def get_kover_jvm_flags(kover_agent_files, kover_args_file):
+def get_kover_jvm_flags(kover_agent_files):
     """Compute the jvm flags used to setup Kover agent.
 
     Args:
         kover_agent_files: List of Kover agent files.
-        kover_args_file: The Kover arguments file.
 
     Returns:
         The flag string to be used by test runner JVM.
+        KOVER_ARGS_FILE shell variable is resolved at runtime by %kover_ic_setup%.
     """
     jvm_args = [
         "-Xbootclasspath/a:%s" % (kover_agent_files[0].short_path),
-        "-javaagent:%s=file:%s" % (kover_agent_files[0].short_path, kover_args_file.short_path),
+        "-javaagent:%s=file:${KOVER_ARGS_FILE}" % (kover_agent_files[0].short_path),
     ]
     return " ".join(jvm_args)
 
@@ -120,7 +120,7 @@ def create_kover_agent_actions(ctx, name):
     )
     ctx.actions.write(
         kover_args_file,
-        "report.file=../../%s" % binary_output_name,  # Kotlin compiler runs in runfiles folder, make sure file is created is correct location
+        "report.file=UNDECLARED_OUTPUTS_PLACEHOLDER/%s" % kover_output_file.short_path,  # Kotlin compiler runs in runfiles folder, make sure file is created is correct location
     )
 
     return kover_output_file, kover_args_file

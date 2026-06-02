@@ -292,6 +292,22 @@ if [[ -n "$TEST_TMPDIR" && -d "$TEST_TMPDIR" ]]; then
   JVM_FLAGS+=" -Djava.io.tmpdir=$TEST_TMPDIR"
 fi
 
+# Resolves a placeholder in a file by substituting a runtime env var value,
+# writes the result to a temp file, and prints the temp file path.
+# Usage: resolve_runtime_placeholder <file> <placeholder> <env_var_name>
+function resolve_runtime_placeholder() {
+  local file="$1"
+  local placeholder="$2"
+  local env_var_name="$3"
+  local value="${!env_var_name}"
+  local temp_file
+  temp_file=$(mktemp)
+  sed "s|${placeholder}|${value}|" "${file}" > "${temp_file}"
+  echo "${temp_file}"
+}
+
+%kover_ic_setup%
+
 ARGS=(
   ${JVM_DEBUG_FLAGS}
   ${JVM_FLAGS}
